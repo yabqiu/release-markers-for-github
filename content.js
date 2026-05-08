@@ -4,7 +4,7 @@
   const PROCESSED_ATTR = "data-commit-tags-processed";
   const BADGE_CLASS = "gct-badge";
   const SHA_RE = /^[0-9a-f]{7,40}$/i;
-  const LOG = (...a) => console.log("[gh-commit-tags]", ...a);
+  const LOG = () => {};
   const WARN = (...a) => console.warn("[gh-commit-tags]", ...a);
 
   // Per-repo cache: `${owner}/${repo}` -> Map<shortSha, string[]>
@@ -15,9 +15,21 @@
   let lastBootedFor = null;
 
   function parseRepoFromUrl() {
-    const m = location.pathname.match(/^\/([^/]+)\/([^/]+)\/commits(?:\/|$)/);
-    if (!m) return null;
-    return { owner: m[1], repo: m[2] };
+    const list = location.pathname.match(
+      /^\/([^/]+)\/([^/]+)\/commits(?:\/|$)/,
+    );
+    if (list) return { kind: "list", owner: list[1], repo: list[2] };
+    const detail = location.pathname.match(
+      /^\/([^/]+)\/([^/]+)\/commit\/([0-9a-f]{7,40})/i,
+    );
+    if (detail)
+      return {
+        kind: "detail",
+        owner: detail[1],
+        repo: detail[2],
+        sha: detail[3],
+      };
+    return null;
   }
 
   function findCommitRows() {
@@ -25,8 +37,8 @@
     const selectors = [
       '[data-testid="list-view-item"]',
       '[data-testid="commit-row-item"]',
-      'li.js-commits-list-item',
-      'li.Box-row',
+      "li.js-commits-list-item",
+      "li.Box-row",
       'div[role="listitem"]',
     ];
     for (const sel of selectors) {
@@ -38,8 +50,10 @@
     }
 
     // Generic fallback: find anchors that point to a commit and walk up to a sensible row.
-    const anchors = Array.from(document.querySelectorAll('a[href*="/commit/"]')).filter((a) =>
-      /\/commit\/[0-9a-f]{7,40}/i.test(a.getAttribute("href") || "")
+    const anchors = Array.from(
+      document.querySelectorAll('a[href*="/commit/"]'),
+    ).filter((a) =>
+      /\/commit\/[0-9a-f]{7,40}/i.test(a.getAttribute("href") || ""),
     );
     const rows = new Set();
     for (const a of anchors) {
@@ -50,7 +64,9 @@
           el.tagName === "LI" ||
           el.tagName === "ARTICLE" ||
           el.getAttribute("role") === "listitem" ||
-          (el.classList && (el.classList.contains("Box-row") || el.classList.contains("js-commits-list-item")))
+          (el.classList &&
+            (el.classList.contains("Box-row") ||
+              el.classList.contains("js-commits-list-item")))
         ) {
           rows.add(el);
           break;
@@ -58,16 +74,20 @@
         el = el.parentElement;
       }
     }
-    LOG(`fallback walk-up found ${rows.size} rows from ${anchors.length} commit anchors`);
+    LOG(
+      `fallback walk-up found ${rows.size} rows from ${anchors.length} commit anchors`,
+    );
     return Array.from(rows);
   }
 
   function extractSha(row) {
     const copyBtn = row.querySelector(
-      'clipboard-copy[value], [data-clipboard-text], button[aria-label*="Copy" i][value]'
+      'clipboard-copy[value], [data-clipboard-text], button[aria-label*="Copy" i][value]',
     );
     if (copyBtn) {
-      const v = copyBtn.getAttribute("value") || copyBtn.getAttribute("data-clipboard-text");
+      const v =
+        copyBtn.getAttribute("value") ||
+        copyBtn.getAttribute("data-clipboard-text");
       if (v && SHA_RE.test(v)) return v;
     }
     const link = row.querySelector('a[href*="/commit/"]');
@@ -110,70 +130,138 @@
   async function fetchTagMap(owner, repo) {
     const map = new Map(); // shortSha -> string[]
 
-    // Single page is enough for typical repos. Could paginate via ?after=<cursor>
-    // by following "Next" anchors if a project has hundreds of tags.
-    const url = `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/tags`;
-    const res = await fetch(url, { credentials: "include", headers: { Accept: "text/html" } });
-    if (!res.ok) {
-      WARN(`/tags fetch ${res.status}`);
-      return map;
+    // Walk every page of /owner/repo/tags via the "Next" cursor link so a tag
+    // that's older than the first page (~10 entries on modern GitHub) still
+    // ends up in the map.
+    const MAX_PAGES = 30;
+    let url = `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/tags`;
+    let pageNum = 0;
+    while (url && pageNum < MAX_PAGES) {
+      pageNum++;
+      const res = await fetch(url, {
+        credentials: "include",
+        headers: { Accept: "text/html" },
+      });
+      if (!res.ok) {
+        WARN(`/tags page ${pageNum} fetch ${res.status}`);
+        break;
+      }
+      const html = await res.text();
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      parseTagsPage(doc, map, pageNum);
+      url = findNextTagsUrl(doc);
     }
-    const html = await res.text();
-    const doc = new DOMParser().parseFromString(html, "text/html");
 
-    // Each tag entry has a primary tag-name link followed (in document order) by
-    // a commit link before the next tag entry. Pair them by source order rather
-    // than walking up the DOM, since the tag link and commit link may live in
-    // sibling subtrees inside the same row container — DOM walk-up will overshoot
-    // and grab the wrong commit link for entries past the first one.
-    const tagLinks = Array.from(
-      doc.querySelectorAll('a[href*="/releases/tag/"]')
-    ).filter((a) => {
+    LOG(
+      `built tag map with ${map.size} unique commits across ${pageNum} page(s)`,
+    );
+    return map;
+  }
+
+  function parseTagsPage(doc, map, pageNum) {
+    // Build the canonical list of tag links: one per unique tag href, first
+    // wins. GitHub's /tags page renders extra links to the same tag (the "…"
+    // menu, "View tag" items, etc.); if those slip into our list as empty- or
+    // dup-text entries they fragment the pairing window and a tag like 1.10.2
+    // ends up with no commit in its range.
+    const seenTagHrefs = new Set();
+    const tagLinks = [];
+    for (const a of doc.querySelectorAll('a[href*="/releases/tag/"]')) {
       const href = a.getAttribute("href") || "";
-      // Skip "Release notes" links: they point at /releases/tag/<name>#... fragments.
-      if (href.includes("#")) return false;
-      // Skip the "Notes" link explicitly (text-only fallback).
-      if ((a.textContent || "").trim().toLowerCase() === "notes") return false;
-      return true;
-    });
-    const commitLinks = Array.from(doc.querySelectorAll('a[href*="/commit/"]'));
-    LOG(`/tags page: ${tagLinks.length} tag links, ${commitLinks.length} commit links`);
+      // Skip release-notes anchors (they carry a #fragment).
+      if (href.includes("#")) continue;
+      const tagPath = (href.match(/\/releases\/tag\/([^/?#]+)/) || [])[1];
+      if (!tagPath) continue;
+      if (seenTagHrefs.has(tagPath)) continue;
+      const text = (a.textContent || "").trim();
+      if (!text) continue;
+      if (text.toLowerCase() === "notes") continue;
+      seenTagHrefs.add(tagPath);
+      tagLinks.push(a);
+    }
+
+    const SHA_TEXT_RE = /^[0-9a-f]{7,40}$/i;
+    LOG(`/tags page ${pageNum}: ${tagLinks.length} tag links (deduped)`);
 
     for (let i = 0; i < tagLinks.length; i++) {
       const tagLink = tagLinks[i];
-      const nextTag = tagLinks[i + 1] || null;
       const name = (tagLink.textContent || "").trim();
       if (!name) continue;
 
-      // Find the first commit link that lies AFTER tagLink and BEFORE nextTag.
-      let pairedCommit = null;
-      for (const cl of commitLinks) {
-        const after = !!(tagLink.compareDocumentPosition(cl) & Node.DOCUMENT_POSITION_FOLLOWING);
-        if (!after) continue;
-        if (nextTag) {
-          const beforeNext = !!(
-            nextTag.compareDocumentPosition(cl) & Node.DOCUMENT_POSITION_PRECEDING
-          );
-          if (!beforeNext) continue;
+      // Find this tag's entry container: walk up from the tag link until the
+      // current ancestor would also enclose a different tag's link. The last
+      // ancestor before that boundary is the row that belongs only to this
+      // tag, so any SHA chip inside it is unambiguously this tag's commit.
+      let entry = null;
+      let el = tagLink.parentElement;
+      for (let depth = 0; depth < 12 && el; depth++) {
+        let enclosesOther = false;
+        for (const other of tagLinks) {
+          if (other === tagLink) continue;
+          if (el.contains(other)) {
+            enclosesOther = true;
+            break;
+          }
         }
-        pairedCommit = cl;
+        if (enclosesOther) break;
+        entry = el;
+        el = el.parentElement;
+      }
+      if (!entry) {
+        WARN(`tag "${name}" has no entry container`);
+        continue;
+      }
+
+      // Find the entry's commit-SHA chip. The /tags page renders it as an
+      // <a> inside `<li class="text-mono">` in the metadata row, with href
+      // /commit/<full-sha> and visible short-SHA text. Targeting that
+      // structure directly skips:
+      //   - inline /commit/<sha> references in `.commit-desc` release notes
+      //   - the GPG key id (16-char hex) inside the Verified signature dialog
+      //   - any other stray /commit/ anchors elsewhere in the entry
+      let shaEl = null;
+      const candidates = entry.querySelectorAll(
+        'li.text-mono a[href*="/commit/"], li[class*="text-mono"] a[href*="/commit/"]'
+      );
+      for (const cand of candidates) {
+        const href = cand.getAttribute("href") || "";
+        const m = href.match(/\/commit\/([0-9a-f]{7,40})/i);
+        if (!m) continue;
+        const text = (cand.textContent || "").trim();
+        if (!SHA_TEXT_RE.test(text)) continue;
+        const hrefSha = m[1].toLowerCase();
+        if (!hrefSha.startsWith(text.toLowerCase())) continue;
+        shaEl = cand;
         break;
       }
-      if (!pairedCommit) continue;
+      if (!shaEl) {
+        WARN(`tag "${name}" has no SHA chip in its entry container`);
+        continue;
+      }
 
-      const shaMatch = (pairedCommit.getAttribute("href") || "").match(
-        /\/commit\/([0-9a-f]{7,40})/i
-      );
-      if (!shaMatch) continue;
-      const shortSha = shaMatch[1].toLowerCase();
+      const shortSha = (shaEl.textContent || "").trim().toLowerCase();
+      if (!SHA_TEXT_RE.test(shortSha)) continue;
+      LOG(`tag "${name}" -> ${shortSha}`);
 
       const list = map.get(shortSha) || [];
       list.push(name);
       map.set(shortSha, list);
     }
+  }
 
-    LOG(`built tag map with ${map.size} unique commits`);
-    return map;
+  function findNextTagsUrl(doc) {
+    // Modern GitHub uses <a rel="next" href="...?after=<cursor>">Next</a>.
+    const relNext = doc.querySelector('a[rel="next"]');
+    if (relNext) return relNext.getAttribute("href");
+    // Fallback: any anchor whose visible text is "Next" and whose href carries
+    // a pagination cursor.
+    const anchors = Array.from(doc.querySelectorAll('a[href*="after="]'));
+    for (const a of anchors) {
+      if ((a.textContent || "").trim().toLowerCase() === "next") {
+        return a.getAttribute("href");
+      }
+    }
+    return null;
   }
 
   function lookupTagsForSha(tagMap, sha) {
@@ -207,7 +295,12 @@
       wrap.appendChild(badge);
     }
 
-    if (anchor && anchor.mode === "before" && anchor.node && anchor.node.parentElement) {
+    if (
+      anchor &&
+      anchor.mode === "before" &&
+      anchor.node &&
+      anchor.node.parentElement
+    ) {
       anchor.node.parentElement.insertBefore(wrap, anchor.node);
     } else if (anchor && anchor.mode === "prepend" && anchor.node) {
       anchor.node.insertBefore(wrap, anchor.node.firstChild);
@@ -217,16 +310,23 @@
   }
 
   async function processPage() {
-    const repo = parseRepoFromUrl();
-    if (!repo) {
-      LOG("URL not a commits page; skipping");
+    const ctx = parseRepoFromUrl();
+    if (!ctx) {
+      LOG("URL not a commits/commit page; skipping");
       return;
     }
     if (lastBootedFor !== location.href) {
-      LOG(`processing ${repo.owner}/${repo.repo} at ${location.href}`);
+      LOG(
+        `processing ${ctx.kind} ${ctx.owner}/${ctx.repo} at ${location.href}`,
+      );
       lastBootedFor = location.href;
     }
 
+    if (ctx.kind === "list") return processCommitListPage(ctx);
+    if (ctx.kind === "detail") return processCommitDetailPage(ctx);
+  }
+
+  async function processCommitListPage(ctx) {
     const allRows = findCommitRows();
     const rows = allRows.filter((r) => !r.hasAttribute(PROCESSED_ATTR));
     if (!rows.length) {
@@ -234,7 +334,7 @@
       return;
     }
 
-    const tagMap = await getTagMap(repo.owner, repo.repo);
+    const tagMap = await getTagMap(ctx.owner, ctx.repo);
 
     let badged = 0;
     for (const row of rows) {
@@ -249,6 +349,93 @@
       }
     }
     LOG(`processed ${rows.length} rows, badged ${badged}`);
+  }
+
+  async function processCommitDetailPage(ctx) {
+    if (document.querySelector(`.${BADGE_CLASS}-wrap--detail`)) return;
+
+    const tagMap = await getTagMap(ctx.owner, ctx.repo);
+    const tags = lookupTagsForSha(tagMap, ctx.sha);
+    if (!tags.length) {
+      LOG(`commit ${ctx.sha.slice(0, 7)} has no tags`);
+      return;
+    }
+    LOG(`commit detail ${ctx.sha.slice(0, 7)} -> tags:`, tags);
+
+    // Re-check: a concurrent invocation may have inserted while we awaited.
+    if (document.querySelector(`.${BADGE_CLASS}-wrap--detail`)) return;
+
+    // Locate the cluster freshly — React's hydration can replace the element
+    // we found before the await, leaving us holding a detached node.
+    const cluster = findCommitDetailRightCluster(ctx.sha);
+    if (
+      !cluster ||
+      !cluster.parentElement ||
+      !document.body.contains(cluster)
+    ) {
+      LOG(
+        "commit detail cluster gone before insert; will retry on next observation",
+      );
+      return;
+    }
+
+    const wrap = document.createElement("span");
+    wrap.className = `${BADGE_CLASS}-wrap ${BADGE_CLASS}-wrap--detail`;
+    for (const name of tags) {
+      const badge = document.createElement("span");
+      badge.className = BADGE_CLASS;
+      badge.textContent = name;
+      badge.title = `Tag: ${name}`;
+      wrap.appendChild(badge);
+    }
+
+    // Insert as the PREVIOUS SIBLING of the parent-info element so the badge
+    // sits immediately to the left of "1 parent …", inside the same flex
+    // group rather than in a wrapper that may include trailing spacers.
+    cluster.parentElement.insertBefore(wrap, cluster);
+    LOG("commit detail badges inserted before anchor:", cluster);
+  }
+
+  function findCommitDetailRightCluster(fullSha) {
+    // Find the SMALLEST element whose text STARTS with "N parent" — that's
+    // the inline element rendering the "1 parent" / "2 parents" run. The
+    // badge inserts as its previous sibling, which places it immediately to
+    // the left of "1 parent" inside the same horizontal flex group.
+    const LEADING = /^\s*\d+\s+parent[s]?\b/i;
+
+    let best = null;
+    let bestSize = Infinity;
+
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_ELEMENT,
+      {
+        acceptNode(el) {
+          const text = (el.textContent || "").trim();
+          if (text.length === 0 || text.length > 200)
+            return NodeFilter.FILTER_SKIP;
+          if (!LEADING.test(text)) return NodeFilter.FILTER_SKIP;
+          return NodeFilter.FILTER_ACCEPT;
+        },
+      },
+    );
+
+    while (walker.nextNode()) {
+      const el = walker.currentNode;
+      const size = el.getElementsByTagName("*").length;
+      if (size < bestSize) {
+        best = el;
+        bestSize = size;
+      }
+    }
+
+    if (best) {
+      LOG("commit detail anchor (smallest leading-parent match):", best);
+      return best;
+    }
+
+    WARN("commit detail anchor not found");
+    return null;
   }
 
   function schedule() {
@@ -274,7 +461,13 @@
 
   // Expose a manual trigger for debugging from DevTools (visible only inside the
   // content-script isolated world).
-  window.__ghCommitTags = { processPage, fetchTagMap, lookupTagsForSha, findCommitRows };
+  window.__ghCommitTags = {
+    processPage,
+    fetchTagMap,
+    lookupTagsForSha,
+    findCommitRows,
+    findCommitDetailRightCluster,
+  };
 
   init();
   document.addEventListener("turbo:load", init);

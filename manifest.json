@@ -1,14 +1,17 @@
 {
   "manifest_version": 3,
   "name": "Release Markers for GitHub",
-  "version": "0.1.0",
-  "description": "Show git tag names next to commits on GitHub commits pages, so you can see at a glance which commit is which release.",
+  "version": "0.2.0",
+  "description": "Show git tag names next to commits on GitHub commits pages and single-commit pages, so you can see at a glance which commit is which release.",
   "author": "Yanbin <yabqiu@gmail.com>",
   "homepage_url": "https://yanbin.blog",
   "host_permissions": ["https://github.com/*"],
   "content_scripts": [
     {
-      "matches": ["https://github.com/*/*/commits/*"],
+      "matches": [
+        "https://github.com/*/*/commits/*",
+        "https://github.com/*/*/commit/*"
+      ],
       "js": ["content.js"],
       "css": ["styles.css"],
       "run_at": "document_idle"
