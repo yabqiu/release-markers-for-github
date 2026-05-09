@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Release Markers for GitHub",
+  "name": "GitHub Tags on Commits",
   "version": "0.2.0",
-  "description": "Show release tag names next to commits on GitHub commit history and detail pages.",
+  "description": "Show all associated git tags next to each commit on GitHub commit list and detail pages.",
   "author": "Yanbin <yabqiu@gmail.com>",
   "homepage_url": "https://yanbin.blog",
   "host_permissions": ["https://github.com/*"],
