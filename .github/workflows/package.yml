@@ -32,12 +32,7 @@ jobs:
             manifest.json \
             content.js \
             styles.css \
-            icons \
-            PRIVACY.md \
-            STORE_LISTING.md \
-            README.md \
-            LICENSE \
-            -x ".*" -x "*/.*"
+            icons
           unzip -l "$ZIP_NAME"
           echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
 
